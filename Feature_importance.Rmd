@@ -1,0 +1,862 @@
+---
+title: "Válvulas reguladoras de presión"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Este es el ejercicio realizado con las valvulas reguladoras de presión para conocer las variables que más influyen en su probabilidad de falla.
+
+Para iniciar se debe hacer el cargue de algunas librerías fundamentales para la ejecución de la metodología, las cuales son:
+
+
+```{r loadlib, echo=T, results='hide', message=F, warning=F}
+library(highcharter) #Gráficos dinámicos
+library(readxl) #Leer archivos de excel
+library(tidyverse) #Manipulación de datos
+library(randomForest) #Algoritmo random forest
+library(caret) #Algoritmos de clasificación y regresión
+library(Boruta) #Feature selection
+library(funModeling) #Information gain
+```
+
+Para cargar los datos primero hay que configurar la ruta en donde se encuentra el conjunto de datos, así:
+
+```{r ruta}
+setwd("C:\\Users\\estiv\\OneDrive\\Escritorio\\Metodologia criticidad\\Datasets VRP")
+```
+
+Es necesario tener en cuenta que el conjunto de datos a analizar previamente ha pasado por un proceso de limpieza y tratamiento de valores atípicos, en este caso de las VRP el dataset a analizar se llama **"Datasinofinalcat.xlsx"**.
+
+```{r datos}
+datos <- read_excel("Datasinofinalcat.xlsx")
+datos
+```
+
+Las variables que van a ser analizadas, son las siguientes:
+
+```{r name}
+colnames(datos)
+```
+
+Para aplicar la metodología, es necesario verificar que las clases de cada variable sean correctas.
+
+```{r vistaso}
+glimpse(datos)
+```
+
+Si las clases no son correctas se deben de configurar, de la siguiente manera:
+
+1. as.numeric : Numérica
+2. as.integer : Entera
+3. as.dbl : Real (decimales)
+4. as.character : Texto
+5. as.factor : Categórica
+
+
+
+```{r clases}
+datos$FALLA <- as.factor(datos$FALLA)
+datos$IPID<- as.character(datos$IPID)
+datos$MARCA<- as.factor(datos$MARCA)
+datos$DIAMETRO<- as.numeric(datos$DIAMETRO)
+datos$CONFIGURACION<- as.factor(datos$CONFIGURACION)
+```
+
+Antes de iniciar con la metodología se deben revisar las variables y eliminar si es que las hay, aquellas que no son de importancia para nuestro análisis, en este caso IPID no influye en la probabilidad de falla de las VRP, sino que únicamente es una variable informativa, entonces se procede a eliminar.
+
+
+```{r}
+datos$IPID<- NULL
+```
+
+## 1. Feature selection (Selección de variables)
+
+### 1.1. Filtro por criterio de expertos
+
+```{r message=FALSE, warning=FALSE,echo = FALSE}
+datos %>% count(ACTUADOR,FALLA)%>%
+     hchart('column', hcaes(x = 'ACTUADOR', y = 'n', group = 'FALLA'),stacking = "normal") %>%
+     hc_colors(c("steelblue", "#B71C1C"))
+```
+
+El hecho de que una VRP tenga o no tenga un actuador es más un atributo operacional que una variable que pueda aumentar o disminuir la probabilidad de falla del activo, es por esto que esta variable es eliminada del análisis.
+
+
+```{r message=FALSE, warning=FALSE, echo = FALSE}
+datos %>% count(REGULACION,FALLA)%>%
+     hchart('column', hcaes(x = 'REGULACION', y = 'n', group = 'FALLA'),stacking = "normal") %>%
+     hc_colors(c("steelblue", "#B71C1C"))
+```
+
+Lo mismo ocurre con la variable regulación, además de que presenta un desbalanceo de las clases en dónde son muchas más las VRP con regulación constante que las de perfil y autorreguladoras.
+
+```{r}
+datos$ACTUADOR<-NULL
+datos$REGULACION<-NULL
+```
+
+### 1.2. Filtro por correlación
+
+Mediante un análisis de correlación de variables, se pueden identificar aquellas variables redundantes, es decir que están en función de otras, un ejemplo sería **(Delta presión = Presión entrada - Presión salida)**
+
+```{r}
+datosnum <- datos[,c(2,4,7,8,9)] 
+corr <- round(cor(datosnum), 2)
+hchart(corr)
+```
+
+
+Después de hacer el análisis preliminar de correlación, no se evidencia efecto de multicolinealidad entonces se continua con las mismas variables en el siguiente paso.
+
+Antes de aplicar los algoritmos de selección de variables, es recomendable normalizar las variables numéricas, esto significa ajustar los valores medidos en diferentes escalas respecto a una escala común.
+
+
+```{r}
+dnum <- datos[,c(2,4,7,8,9)]#datos numéricos
+scaled.dat <- scale(dnum) #escalar (normalizar) los datos
+datosc<- datos[,c(1,3,5,6)] #datos categóricos
+datos <- cbind(datosc,scaled.dat) #volver a unir numéricos escalados + categóricos
+```
+
+### 1.3. Boruta:
+
+Lo que hace el algoritmo es copiar las mismas variables de forma aleatoria (variables sombra) y generar el modelo Random forest con las nuevas variables, lo que se pretende es que las características no compitan entre sí, sino que compitan con una versión aleatoria de ellas, una vez generado el modelo se elige la variable con mayor importancia de las variables sombra y este se establece como un umbral a superar, para más información [Boruta](https://towardsdatascience.com/boruta-explained-the-way-i-wish-someone-explained-it-to-me-4489d70e154a).
+
+
+```{r message=FALSE, warning=FALSE}
+boruta_output <- Boruta(FALLA ~ ., data=na.omit(datos), doTrace=0)
+```
+
+En Boruta algunas variables quedan en la zona de indecisión, sin embargo Boruta tiene una función para hacer el trabajo de elegir aquellas variables tentativas más importantes mediante una prueba simplificada y más débil para juzgar tales atributos.
+
+```{r message=FALSE, warning=FALSE}
+roughFixMod <- TentativeRoughFix(boruta_output) #De las tentativas, elige las de mayor importancia
+boruta_signif <- getSelectedAttributes(roughFixMod) #Almacenar todas las variables seleccionadas
+```
+
+Finalmente, las variables seleccionadas y sus medidas de importancia, son:
+```{r}
+imps <- attStats(roughFixMod) 
+imps2 = imps[imps$decision != 'Rejected', c('meanImp', 'decision')] 
+boruta_pesos<- imps2[order(-imps2$meanImp), ] 
+
+boruta_pesos["Variable"]<- row.names(boruta_pesos)
+boruta_pesos <- data.frame(boruta_pesos[,3],boruta_pesos[,1])
+names(boruta_pesos)<- c("Variable","Boruta")
+boruta_pesos["Importancia (%) Boruta"]<- (boruta_pesos$Boruta/sum(boruta_pesos$Boruta))*100
+boruta_pesos <- arrange(boruta_pesos, -boruta_pesos$`Importancia (%)`)
+boruta_pesos
+```
+
+En Boruta se genera una gráfica en donde las variables en color verde son aquellas de mayor importancia, las de color amarillo son variables tentativas, las azules son las variables sombra generadas(máximo y mínimo) y las de color rojo son variables rechazadas que no aportan información relevante para el modelo Random Forest.
+
+```{r}
+plot(boruta_output, cex.axis=.7, las=2, xlab="", main="Importancia de  las variables")
+```
+
+En conclusión Boruta, para este caso de las VRP asume que todas las variables que se están teniendo en cuenta son relevantes en cuanto a su influencia en la probabilidad de fallo y por ende ninguna es eliminada.
+
+
+
+### 1.4. RFE (*Recursive Feature Selection*):
+
+Para aplicar RFE, primero se deben de dividir en variables descriptoras (independientes) y variable objetivo (dependiente).
+
+```{r}
+x <- datos[,2:9] #las variables de la 2 a la 9 son descriptoras
+y <- datos[,1] #La variable 1 es la variable de interes: FALLA
+y<- as.factor(y) #Se configura la clase de FALLA como factor (categórica)
+```
+
+Después se configura el algoritmo de la siguiente manera:
+
+1. Se define un control en donde se especifican los detalles de los algoritmos de selección de características, en este caso **functions = rfFuncs** significa que el modelo a ajustar es random forest. 
+
+```{r}
+control <- rfeControl(functions=rfFuncs, method="cv", number=10)
+```
+
+2. Se ejecuta el algoritmo RFE, dando como parametros a: **x** (variables descriptoras), **y** (variable objetivo), **sizes** significa que se van a analizar subconjuntos de 1 sola variable, luego 2 variables, asi sucesivamente hasta analizar todas las variables juntas.
+
+```{r}
+set.seed(1)
+results <- rfe(x,y, sizes=c(1:9), rfeControl=control)
+results
+```
+
+```{r}
+plot(results, type=c("g", "o"))# ver nUmero óptimo de variables con las que el modelo obtiene su mejor efectividad (accuracy)
+```
+
+```{r}
+predictors(results)# lista de las variables elegidas, en orden de importancia
+```
+
+Se logra observar que el algoritmo logra el mejor accuracy con todas las variables predictoras (8 de 8) y según su orden de importancia se tiene que la variable más importante según RFE es presión de punto bajo.
+
+La idea para hacer la eliminación de variables que no aportan al modelo es que una misma variable no sea tenida en cuenta ni por Boruta ni por RFE o de lo contrario que si en uno de los algoritmos, ya sea Boruta o RFE la variable es eliminada en el otro sean de las menos importantes.
+
+
+## 2. Porcentajes de contribución (%)
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+
+#En este caso se trabaja con 4 diferentes medidas de importancia **Mean decrease Gini, Mean decrease accuracy, information Gain, Boruta**
+
+### 2.1. Boruta:
+#Las medidas de boruta ya habÃ­an sido generadas anteriormente
+
+# boruta_pesos
+# highchart() %>%
+#      hc_chart(type = 'bar') %>%
+#      hc_xAxis(categories = boruta_pesos$Variable) %>%
+#      hc_add_series(boruta_pesos$`Importancia (%) Boruta`, name = 'Pesos') %>%
+#      hc_plotOptions(series = list(animation = FALSE))%>% 
+#      hc_add_theme(hc_theme_ffx())
+# 
+# #En este caso se trabaja con 4 diferentes medidas de importancia **Mean decrease Gini, Mean decrease accuracy, information Gain, Boruta**
+# 
+# ### 2.3. Information Gain
+# 
+# variable_importance = var_rank_info(datos, "FALLA") #Generar medida de information gain
+# 
+# #Visualizacion en forma de tabla
+# gr <- cbind.data.frame(variable_importance$var,variable_importance$gr)
+# gr <- data.frame(gr[,1],gr[,2])
+# names(gr)<- c("Variable","InformationGain")
+# gr["Importancia (%) Gr"]<- (gr$InformationGain/sum(gr$InformationGain))*100
+# gr <- arrange(gr, -gr$`Importancia (%)`)
+# gr
+# 
+# highchart() %>%
+#          hc_chart(type = 'bar') %>%
+#          hc_xAxis(categories = gr$Variable) %>%
+#          hc_add_series(gr$`Importancia (%) Gr`, name = 'Pesos') %>%
+#          hc_plotOptions(series = list(animation = FALSE))%>% 
+#          hc_add_theme(hc_theme_ffx())
+```
+
+
+El primer paso para generar las medidas de importancia consiste en optimizar el hiperparámetro **mtry** que representa el nivel de profundidad óptimo de los áboles de decisión generados en el modelo **Random forest**.
+
+```{r}
+#Optimizar el hiperparámetro de mtry: Nivel de profundidad
+set.seed(1)
+bestmtry <- tuneRF(x, y, stepFactor=1.5, improve=1e-5)
+```
+
+Una vez que ya se conoce que el número óptimo *mtry** es 3, se ajusta al modelo de random forest que se va a generar.
+
+```{r}
+#Ejecutar el modelo con el valor de mtry que se generO en el paso anterior
+modelo_randforest <- randomForest(formula = FALLA ~ . ,
+                                  data = datos,
+                                  mtry = 3,
+                                  importance = TRUE, 
+                                  ntree = 1000) 
+```
+
+
+```{r}
+#Evaluar efectividad del modelo
+conf <- modelo_randforest$confusion
+accuracy_Test <- sum(diag(conf)) / sum(conf)
+accuracy_Test
+```
+
+```{r}
+importancia <- as.data.frame(modelo_randforest$importance)
+importancia <- rownames_to_column(importancia,var = "variable")
+gini_pesos <- data.frame(importancia[,1],importancia[,5])
+names(gini_pesos)<- c("Variable","Gini")
+gini_pesos["Importancia (%) gini"]<- (gini_pesos$Gini/sum(gini_pesos$Gini))*100
+gini_pesos <- arrange(gini_pesos, -gini_pesos$`Importancia (%)`)
+gini_pesos
+```
+
+```{r, echo=FALSE, echo = FALSE}
+highchart() %>%
+         hc_chart(type = 'bar') %>%
+         hc_xAxis(categories = gini_pesos$Variable) %>%
+         hc_add_series(gini_pesos$`Importancia (%) gini`, name = 'Pesos') %>%
+         hc_plotOptions(series = list(animation = FALSE))%>% 
+         hc_add_theme(hc_theme_ffx())
+```
+
+Al final se puede tener un último filtro donde aquellas variables cuyo porcentaje de contribución sea inferior a un 5% podrían ser eliminadas, en este caso la variable candidata a eliminar es **configuración**.
+
+```{r}
+datos$CONFIGURACION<-NULL
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+
+x <- datos[,2:8] 
+y <- datos[,1] 
+y<- as.factor(y)
+
+
+set.seed(1)
+modelo_randforest <- randomForest(formula = FALLA ~ . ,
+                                  data = datos,
+                                  mtry = 2,
+                                  importance = TRUE, 
+                                  ntree = 1000) 
+
+
+importancia <- as.data.frame(modelo_randforest$importance)
+importancia <- rownames_to_column(importancia,var = "variable")
+gini_pesos <- data.frame(importancia[,1],importancia[,5])
+names(gini_pesos)<- c("Variable","Gini")
+gini_pesos["Importancia (%) gini"]<- (gini_pesos$Gini/sum(gini_pesos$Gini))*100
+gini_pesos <- arrange(gini_pesos, -gini_pesos$`Importancia (%)`)
+
+```
+
+## Porcentajes de contribución final para las VRP
+
+```{r}
+gini_pesos
+```
+
+```{r, echo=FALSE}
+highchart() %>%
+         hc_chart(type = 'bar') %>%
+         hc_xAxis(categories = gini_pesos$Variable) %>%
+         hc_add_series(gini_pesos$`Importancia (%) gini`, name = 'Pesos') %>%
+         hc_plotOptions(series = list(animation = FALSE))%>% 
+         hc_add_theme(hc_theme_ffx())
+```
+
+# Si la variable objetivo es NFALLA (Número acumulado de fallas)
+
+Otra forma de realizar el análisis de importancia de las variables es en vez de considerar como variable objetivo la variable categórica FALLA que dice si ha o no ha fallado una VRP, considerar la variable numérica NFALLA que representa el número acumulado de fallas en 5 años para las VRP.
+
+El objetivo es comparar las medidas de efectividad de ambos modelos y elegir aquel que mejor medida presente.
+
+
+```{r}
+datos <- read_excel("Datasinofinalcat2.xlsx")
+```
+
+```{r}
+datos$FALLA <- as.factor(datos$FALLA)
+datos$IPID<- as.character(datos$IPID)
+datos$MARCA<- as.factor(datos$MARCA)
+datos$DIAMETRO<- as.numeric(datos$DIAMETRO)
+datos$CONFIGURACION<- as.factor(datos$CONFIGURACION)
+```
+
+
+
+
+## 1. Feature selection (Selección de variables)
+
+### 1.1. Filtro por criterio de expertos
+
+
+```{r}
+datos$ACTUADOR<-NULL
+datos$REGULACION<-NULL
+```
+
+```{r}
+datos$IPID<- NULL
+datos$FALLA<-NULL #Se elimina la variable categórica FALLA
+```
+
+### 1.2. Filtro por correlación
+
+
+```{r}
+datosnum <- datos[,c(1,2,4,7,8,9)] 
+corr <- round(cor(datosnum), 2)
+hchart(corr)
+```
+
+
+```{r}
+dnum <- datos[,c(2,4,7,8,9)]#datos numéricos
+scaled.dat <- scale(dnum) #escalar (normalizar) los datos
+datosc<- datos[,c(1,3,5,6)] #datos categóricos
+datos <- cbind(datosc,scaled.dat) #volver a unir numéricos escalados + categoricos
+```
+
+
+```{r message=FALSE, warning=FALSE}
+boruta_output <- Boruta(NFALLA ~ ., data=na.omit(datos), doTrace=0)
+```
+
+
+```{r message=FALSE, warning=FALSE}
+roughFixMod <- TentativeRoughFix(boruta_output) #De las tentativas, elige las de mayor importancia
+boruta_signif <- getSelectedAttributes(roughFixMod) #Almacenar todas las variables seleccionadas
+```
+
+
+```{r}
+imps <- attStats(roughFixMod) #Medidas de importancia generadas por boruta
+
+imps2 = imps[imps$decision != 'Rejected', c('meanImp', 'decision')] #No mostrar las variables rechazadas, es decir solo ver aquellas aceptadas
+boruta_pesos<- imps2[order(-imps2$meanImp), ] #Ordenar de mayor a menor
+
+#VisualizaciÃÂÃÂ³n de la salida en forma de tabla
+boruta_pesos["Variable"]<- row.names(boruta_pesos)
+boruta_pesos <- data.frame(boruta_pesos[,3],boruta_pesos[,1])
+names(boruta_pesos)<- c("Variable","Boruta")
+boruta_pesos["Importancia (%) Boruta"]<- (boruta_pesos$Boruta/sum(boruta_pesos$Boruta))*100
+boruta_pesos <- arrange(boruta_pesos, -boruta_pesos$`Importancia (%)`)
+boruta_pesos
+```
+
+
+```{r}
+plot(boruta_output, cex.axis=.7, las=2, xlab="", main="Importancia de  las variables")
+```
+
+Cuando la variable objetivo es NFALLA según Boruta la variable menos relevante es la variable edad, mientras que las más importantes son el diámetro y y la presión de punto bajo.
+
+
+### 1.4. RFE (*Recursive Feature Selection*):
+
+
+```{r}
+x <- datos[,2:9] #las variables de la 2 a la 9 son descriptoras
+y <- datos[,1] #La variable 1 es la variable de interes: NFALLA
+#Se configura la clase de NFALLA como factor (categorica)
+```
+
+
+```{r}
+control <- rfeControl(functions=rfFuncs, method="cv", number=10)
+```
+
+
+```{r}
+set.seed(1)
+results <- rfe(x,y, sizes=c(1:9), rfeControl=control)
+results
+```
+
+```{r}
+plot(results, type=c("g", "o"))# ver nUmero optimo de variables con la que el modelo obtiene su mejor efectividad (accuracy)
+```
+
+```{r}
+predictors(results)# lista de las variables elegidas, en orden de importancia
+```
+
+
+## 2. Porcentajes de contribución (%)
+
+
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+### 2.1. Boruta:
+#Las medidas de boruta ya habían sido generadas anteriormente.
+
+# boruta_pesos
+# highchart() %>%
+#      hc_chart(type = 'bar') %>%
+#      hc_xAxis(categories = boruta_pesos$Variable) %>%
+#      hc_add_series(boruta_pesos$`Importancia (%) Boruta`, name = 'Pesos') %>%
+#      hc_plotOptions(series = list(animation = FALSE))%>% 
+#      hc_add_theme(hc_theme_ffx())
+# 
+# 
+# #Visualizacion en forma de tabla de las medidas de mean decrease purity
+# purity_pesos <- data.frame(importancia[,1],importancia[,3])
+# names(purity_pesos)<- c("Variable","purity")
+# purity_pesos["Importancia (%) purity"]<- (purity_pesos$purity/sum(purity_pesos$purity))*100
+# purity_pesos <- arrange(purity_pesos, -purity_pesos$`Importancia (%) purity`)
+# purity_pesos
+# 
+# highchart() %>%
+#          hc_chart(type = 'bar') %>%
+#          hc_xAxis(categories = purity_pesos$Variable) %>%
+#          hc_add_series(purity_pesos$`Importancia (%) purity`, name = 'Pesos') %>%
+#          hc_plotOptions(series = list(animation = FALSE))%>% 
+#          hc_add_theme(hc_theme_ffx())
+# 
+# 
+# # Information gain
+# variable_importance = var_rank_info(datos, "NFALLA") #Generar medida de information gain
+# 
+# gr <- cbind.data.frame(variable_importance$var,variable_importance$gr)
+# gr <- data.frame(gr[,1],gr[,2])
+# names(gr)<- c("Variable","InformationGain")
+# gr["Importancia (%) Gr"]<- (gr$InformationGain/sum(gr$InformationGain))*100
+# gr <- arrange(gr, -gr$`Importancia (%)`)
+# gr
+# 
+# highchart() %>%
+#          hc_chart(type = 'bar') %>%
+#          hc_xAxis(categories = gr$Variable) %>%
+#          hc_add_series(gr$`Importancia (%) Gr`, name = 'Pesos') %>%
+#          hc_plotOptions(series = list(animation = FALSE))%>% 
+#          hc_add_theme(hc_theme_ffx())
+
+```
+
+
+
+
+```{r}
+#Optimizar el hiperparámetro de mtry: Nivel de profundidad
+set.seed(1)
+bestmtry <- tuneRF(x, y, stepFactor=1.5, improve=1e-5)
+```
+
+
+```{r}
+#Ejecutar el modelo con el valor de mtry que se generO en el paso anterior
+modelo_randforest <- randomForest(formula = NFALLA ~ . ,
+                                  data = datos,
+                                  mtry = 2,
+                                  importance = TRUE, 
+                                  ntree = 1000) 
+```
+
+```{r}
+plot(modelo_randforest)
+```
+
+```{r}
+importancia <- as.data.frame(modelo_randforest$importance)
+importancia <- rownames_to_column(importancia,var = "variable")
+mse_pesos <- data.frame(importancia[,1],importancia[,2])
+names(mse_pesos)<- c("Variable","MSE")
+mse_pesos["Importancia (%) MSE"]<- (mse_pesos$MSE/sum(mse_pesos$MSE))*100
+mse_pesos <- arrange(mse_pesos, -mse_pesos$`Importancia (%) MSE`)
+mse_pesos
+```
+
+```{r, echo=FALSE, echo = FALSE}
+highchart() %>%
+         hc_chart(type = 'bar') %>%
+         hc_xAxis(categories = mse_pesos$Variable) %>%
+         hc_add_series(mse_pesos$`Importancia (%) MSE`, name = 'Pesos') %>%
+         hc_plotOptions(series = list(animation = FALSE))%>% 
+         hc_add_theme(hc_theme_ffx())
+```
+
+```{r}
+modelo_randforest
+```
+
+
+La efectividad del modelo cuando se tiene como variable objetivo a NFALLA (Número acumulado de fallas desde el 2015-2020) es de 16.12%, mientras que cuando se tiene como variable objetivo a la variable categórica falla la efectividad es del 67%
+
+
+```{r}
+accuracy_Test
+```
+
+De acuerdo a lo anterior la metodología elegida es teniendo en cuenta a la variable objetivo categórica FALLA que representa si por lo menos la VRP ha fallado una vez o si por el contrario nunca ha fallado.
+
+
+## Análisis descriptivo
+
+El componente descriptivo tiene como objetivo principal informar que sucedió durante un periodo de anÃ¡lisis específico, debido a esta necesidad, este componente es principalmente grÃ¡fico. En este caso, se propone describir el desempeÃ±o asociado respecto a si ha o no ha fallado cada una de las VRP en el periodo comprendido desde el 2015 hasta el 2020, de acuerdo con las variables con que se finalizÃ³ el proceso de importancia de las variables.
+
+
+```{r ini, echo=FALSE, results='hide', message=F, warning=F}
+library(highcharter)
+library(readxl)
+library(tidyverse)
+library(ggplot2)
+library(tidyverse)
+setwd("C:\\Users\\estiv\\OneDrive\\Escritorio\\Metodologia criticidad\\Datasets VRP")
+datos <- read_excel("Datasinofinalcat.xlsx")
+
+#estructura datos
+datos$FALLA <- as.factor(datos$FALLA)
+datos$IPID<- as.character(datos$IPID)
+datos$MARCA<- as.factor(datos$MARCA)
+datos$DIAMETRO<- as.numeric(datos$DIAMETRO)
+datos$CONFIGURACION<- as.factor(datos$CONFIGURACION)
+datos$CONFIGURACION<- as.factor(datos$CONFIGURACION)
+datos$REGULACION<- as.factor(datos$REGULACION)
+datos$ACTUADOR<- as.factor(datos$ACTUADOR)
+datos$IPID<- NULL
+```
+
+
+### Fallas
+
+```{r,echo=FALSE}
+a<-table(datos$FALLA)
+a<-as.data.frame(a)
+names(a) <- c("FALLA","Frecuencia")
+a %>% 
+     hchart('column', hcaes(x = 'FALLA', y = 'Frecuencia',group = "FALLA"),
+          stacking = "normal") %>%
+     hc_colors(c("steelblue","red"))
+```
+
+
+
+### Presión de punto bajo
+
+```{r,echo=FALSE}
+f <- datos %>% filter(FALLA == "Si")
+m <- datos %>% filter(FALLA == "No")
+hchart(density(m$PRESION_PTO_BAJO_FALLA), type = "area", 
+     color = "steelblue", name = "No") %>%
+     hc_add_series(density(f$PRESION_PTO_BAJO_FALLA), type = "area",color = "#B71C1C", name = "Si")%>%
+     hc_xAxis(
+    plotLines = list(
+      list(color = "#3CB371", width = 2, value = 108, zIndex = 5),
+      list(color = "#3CB371", width = 2, value = 85, zIndex = 5),
+      list(color = "#3CB371", width = 2, value = 145, zIndex = 5)
+      )
+  ) 
+    
+```
+
+
+
+
+```{r, echo=FALSE, message=F, warning=F}
+hcboxplot(
+        x = datos$PRESION_PTO_BAJO_FALLA,
+        var = datos$FALLA,
+        name = "Length",
+        color = "#2980b9",
+        outliers = TRUE
+) %>%
+        hc_chart(type = "column") %>%
+        hc_title(text = "Presion punto bajo") %>%
+        hc_yAxis(title = list(text = "[mca]")) %>%
+        hc_add_series(
+                data = datos,
+                type = "scatter",
+                hcaes(x = "FALLA", y = "datos$PRESION_PTO_BAJO_FALLA", group = "FALLA")
+        ) %>%
+        hc_plotOptions(scatter = list(
+                color = "red",
+                marker = list(
+                        radius = 2,
+                        symbol = "circle",
+                        lineWidth = 1
+                )
+        ))  %>%
+        hc_plotOptions(scatter = list(jitter = list(x = .1, y = 0)))
+
+```
+
+
+
+### Edad
+
+```{r, echo=FALSE}
+f <- datos %>% filter(FALLA == "Si")
+m <- datos %>% filter(FALLA == "No" )
+
+
+hchart(density(m$EDAD), type = "area", 
+     color = "steelblue", name = "No") %>%
+     hc_add_series(density(f$EDAD), type = "area",color = "#B71C1C", name = "Si") %>% 
+        hc_xAxis(
+    plotLines = list(
+      list(color = "#3CB371", width = 2, value = 9.2, zIndex = 5),
+      list(color = "#3CB371", width = 2, value = 2.3, zIndex = 5)
+      )
+  ) 
+```
+
+```{r, echo=FALSE}
+k <- datos %>% filter(EDAD >= 2.3)
+f <- k %>% filter(FALLA == "Si")
+m <- k %>% filter(FALLA == "No" )
+
+
+hchart(density(m$EDAD), type = "area", 
+     color = "steelblue", name = "No") %>%
+     hc_add_series(density(f$EDAD), type = "area",color = "#B71C1C", name = "Si") %>% 
+        hc_xAxis(
+    plotLines = list(
+      list(color = "#3CB371", width = 2, value = 9.2, zIndex = 5),
+      list(color = "#3CB371", width = 2, value = 2.3, zIndex = 5)
+      )
+  ) 
+```
+
+
+```{r, echo=FALSE, message=F, warning=F}
+hcboxplot(
+        x = datos$EDAD,
+        var = datos$FALLA,
+        name = "Length",
+        color = "#2980b9",
+        outliers = TRUE
+) %>%
+        hc_chart(type = "column") %>%
+        hc_title(text = "Edad") %>%
+        hc_yAxis(title = list(text = "Edad [años]")) %>%
+        hc_add_series(
+                data = datos,
+                type = "scatter",
+                hcaes(x = "FALLA", y = "datos$EDAD", group = "FALLA")
+        ) %>%
+        hc_plotOptions(scatter = list(
+                color = "red",
+                marker = list(
+                        radius = 2,
+                        symbol = "circle",
+                        lineWidth = 1
+                )
+        ))  %>%
+        hc_plotOptions(scatter = list(jitter = list(x = .1, y = 0)))
+
+```
+
+### Indice de cavitación
+
+
+```{r, echo=FALSE}
+f <- datos %>% filter(FALLA == "Si" & INDICE_CAVITACION_ESTIMADO <=5)
+m <- datos %>% filter(FALLA == "No" & INDICE_CAVITACION_ESTIMADO <=5)
+hchart(density(m$INDICE_CAVITACION_ESTIMADO), type = "area", 
+     color = "steelblue", name = "No") %>%
+     hc_add_series(density(f$INDICE_CAVITACION_ESTIMADO), type = "area",color = "#B71C1C", name = "Si")%>%
+    hc_xAxis(
+    plotLines = list(
+      list(color = "#3CB371", width = 2, value = 0.9, zIndex = 5),
+      list(color = "#3CB371", width = 2, value = 0.53, zIndex = 5),
+      list(color = "#3CB371", width = 2, value = 1.21, zIndex = 5)
+      )
+  ) 
+```
+
+
+```{r, echo=FALSE, message=F, warning=F}
+data <- datos %>% filter(INDICE_CAVITACION_ESTIMADO <=5)
+hcboxplot(
+        x = data$INDICE_CAVITACION_ESTIMADO,
+        var = data$FALLA,
+        name = "Length",
+        color = "#2980b9",
+        outliers = TRUE
+) %>%
+        hc_chart(type = "column") %>%
+        hc_title(text = "Indice cavitación") %>%
+        hc_yAxis(title = list(text = "Cavitación")) %>%
+        hc_add_series(
+                data = data,
+                type = "scatter",
+                hcaes(x = "FALLA", y = "data$INDICE_CAVITACION_ESTIMADO", group = "FALLA")
+        ) %>%
+        hc_plotOptions(scatter = list(
+                color = "red",
+                marker = list(
+                        radius = 2,
+                        symbol = "circle",
+                        lineWidth = 1
+                )
+        ))  %>%
+        hc_plotOptions(scatter = list(jitter = list(x = .1, y = 0)))
+
+```
+
+### Delta de presión
+
+```{r, echo=FALSE}
+f <- datos %>% filter(FALLA == "Si")
+m <- datos %>% filter(FALLA == "No")
+hchart(density(m$DELTA_PRESION), type = "area", 
+     color = "steelblue", name = "No") %>%
+     hc_add_series(density(f$DELTA_PRESION), type = "area",color = "#B71C1C", name = "Si")%>%
+      hc_xAxis(
+    plotLines = list(
+      list(color = "#3CB371", width = 2, value = 35, zIndex = 5),
+      list(color = "#3CB371", width = 2, value = 53, zIndex = 5)
+      )
+  ) 
+```
+
+
+
+```{r, echo=FALSE, message=F, warning=F}
+hcboxplot(
+        x = datos$DELTA_PRESION,
+        var = datos$FALLA,
+        name = "Length",
+        color = "#2980b9",
+        outliers = TRUE
+) %>%
+        hc_chart(type = "column") %>%
+        hc_title(text = "Delta de presión") %>%
+        hc_yAxis(title = list(text = "[mca]")) %>%
+        hc_add_series(
+                data = datos,
+                type = "scatter",
+                hcaes(x = "FALLA", y = "datos$DELTA_PRESION", group = "FALLA")
+        ) %>%
+        hc_plotOptions(scatter = list(
+                color = "red",
+                marker = list(
+                        radius = 2,
+                        symbol = "circle",
+                        lineWidth = 1
+                )
+        ))  %>%
+        hc_plotOptions(scatter = list(jitter = list(x = .1, y = 0)))
+
+```
+
+
+
+
+
+### Circuito
+
+```{r, echo=FALSE}
+datos %>% count(CIRCUITO,FALLA)%>%
+     hchart('column', hcaes(x = 'CIRCUITO', y = 'n', group = 'FALLA'),stacking = "normal") %>%
+     hc_colors(c("steelblue", "#B71C1C"))
+```
+
+
+
+
+
+### Marca
+
+```{r, echo=FALSE}
+datos %>% count(MARCA,FALLA)%>%
+     hchart('column', hcaes(x = 'MARCA', y = 'n', group = 'FALLA'),stacking = "normal") %>%
+     hc_colors(c("steelblue", "#B71C1C"))
+```
+
+
+
+
+### Diámetro
+
+```{r, echo=FALSE}
+f <- datos %>% filter(FALLA == "Si")
+m <- datos %>% filter(FALLA == "No" )
+
+
+hchart(density(m$DIAMETRO), type = "area", 
+     color = "steelblue", name = "No") %>%
+     hc_add_series(density(f$DIAMETRO), type = "area",color = "#B71C1C", name = "Si") %>% 
+        hc_xAxis(
+    plotLines = list(
+      list(color = "#3CB371", width = 2, value = 90, zIndex = 5)
+      )
+  ) 
+```
+
+```{r, echo=FALSE}
+datos %>% count(DIAMETRO,FALLA)%>%
+     hchart('column', hcaes(x = 'DIAMETRO', y = 'n', group = 'FALLA'),stacking = "normal") %>%
+     hc_colors(c("steelblue", "#B71C1C"))
+```
+
+
